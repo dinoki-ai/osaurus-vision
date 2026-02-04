@@ -1,0 +1,16 @@
+# Build artifacts
+.build/
+*.dylib
+Package.resolved
+
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+
+# macOS
+.DS_Store
+
+# Distribution
+*.zip
+dist/
