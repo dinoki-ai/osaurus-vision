@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import Foundation
+import PDFKit
 import Testing
 
 // MARK: - Test Utilities
@@ -19,6 +20,44 @@ struct TestImageGenerator {
   static func cleanup() {
     // Don't cleanup during parallel test runs - the temp directory is per-process anyway
     // and will be cleaned up by the system
+  }
+
+  /// Create a PDF with text for OCR testing
+  static func createTextPDF(text: String, pages: Int = 1) throws -> URL {
+    let url = tempDir.appendingPathComponent("text_\(UUID().uuidString).pdf")
+    let pageRect = CGRect(x: 0, y: 0, width: 612, height: 792)  // Letter size
+
+    guard let pdfContext = CGContext(url as CFURL, mediaBox: nil, nil) else {
+      throw NSError(
+        domain: "TestImageGenerator", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Failed to create PDF context"])
+    }
+
+    for pageNum in 1...pages {
+      var pageBox = pageRect
+      pdfContext.beginPage(mediaBox: &pageBox)
+
+      // White background
+      pdfContext.setFillColor(CGColor.white)
+      pdfContext.fill(pageRect)
+
+      // Draw text
+      let pageText = pages > 1 ? "\(text) - Page \(pageNum)" : text
+      let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: 48),
+        .foregroundColor: NSColor.black,
+      ]
+      let attrString = NSAttributedString(string: pageText, attributes: attrs)
+      let line = CTLineCreateWithAttributedString(attrString)
+
+      pdfContext.textPosition = CGPoint(x: 72, y: pageRect.height - 100)
+      CTLineDraw(line, pdfContext)
+
+      pdfContext.endPage()
+    }
+
+    pdfContext.closePDF()
+    return url
   }
 
   /// Create a simple colored image
@@ -216,7 +255,7 @@ struct TestImageGenerator {
 }
 
 /// Helper to invoke plugin tools by loading the dylib dynamically
-final class PluginInvoker {
+final class PluginInvoker: @unchecked Sendable {
   typealias PluginEntry = @convention(c) () -> UnsafeRawPointer?
 
   struct PluginAPI {
@@ -233,11 +272,14 @@ final class PluginInvoker {
       )?
   }
 
+  /// Shared instance for all tests to use - avoids race conditions with parallel test execution
+  static let shared: PluginInvoker = try! PluginInvoker()
+
   private let handle: UnsafeMutableRawPointer
   let api: PluginAPI
   let ctx: UnsafeMutableRawPointer
 
-  init() throws {
+  private init() throws {
     // Find the dylib in the build directory
     let dylibPath = Self.findDylib()
     guard let h = dlopen(dylibPath, RTLD_NOW) else {
@@ -262,7 +304,10 @@ final class PluginInvoker {
 
   deinit {
     api.destroy?(ctx)
-    dlclose(handle)
+    // Note: We intentionally don't call dlclose(handle) here.
+    // When tests run in parallel, calling dlclose can unload the dylib
+    // while another test is still using it, causing hangs or crashes.
+    // The OS will clean up the handle when the process exits.
   }
 
   private static func findDylib() -> String {
@@ -312,12 +357,12 @@ final class PluginInvoker {
 
 // MARK: - Tests
 
-@Suite("Vision Plugin Tests")
+@Suite("Vision Plugin Tests", .serialized)
 struct VisionPluginTests {
 
   @Test("Plugin manifest is valid")
   func testManifest() throws {
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
     let manifest = invoker.getManifest()
 
     #expect(manifest["plugin_id"] as? String == "osaurus.vision")
@@ -326,7 +371,7 @@ struct VisionPluginTests {
 
     let capabilities = manifest["capabilities"] as! [String: Any]
     let tools = capabilities["tools"] as! [[String: Any]]
-    #expect(tools.count == 14)
+    #expect(tools.count == 15)
 
     let toolIds = tools.map { $0["id"] as! String }
     #expect(toolIds.contains("detect_text"))
@@ -335,7 +380,7 @@ struct VisionPluginTests {
   }
 }
 
-@Suite("Text Detection Tests")
+@Suite("Text Detection Tests", .serialized)
 struct TextDetectionTests {
 
   @Test("Detect text in image with text")
@@ -344,7 +389,7 @@ struct TextDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createTextImage(text: "Hello World")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_text",
@@ -367,7 +412,7 @@ struct TextDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createTextImage(text: "Quick Test")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_text",
@@ -380,7 +425,125 @@ struct TextDetectionTests {
   }
 }
 
-@Suite("Document Detection Tests")
+@Suite("PDF Support Tests", .serialized)
+struct PDFSupportTests {
+
+  @Test("Detect text in PDF")
+  func testDetectTextInPDF() throws {
+    try TestImageGenerator.setup()
+    defer { TestImageGenerator.cleanup() }
+
+    let pdfUrl = try TestImageGenerator.createTextPDF(text: "PDF Test Document")
+    let invoker = PluginInvoker.shared
+
+    let result = invoker.invoke(
+      tool: "detect_text",
+      args: [
+        "image_path": pdfUrl.path
+      ])
+
+    #expect(result["error"] == nil)
+    let textBlocks = result["text_blocks"] as? [[String: Any]]
+    #expect(textBlocks != nil)
+    print("PDF text blocks detected: \(textBlocks?.count ?? 0)")
+  }
+
+  @Test("Detect text in PDF with page selection")
+  func testDetectTextInPDFPage() throws {
+    try TestImageGenerator.setup()
+    defer { TestImageGenerator.cleanup() }
+
+    let pdfUrl = try TestImageGenerator.createTextPDF(text: "Multi Page", pages: 3)
+    let invoker = PluginInvoker.shared
+
+    // Test page 2
+    let result = invoker.invoke(
+      tool: "detect_text",
+      args: [
+        "image_path": pdfUrl.path,
+        "page": 2
+      ])
+
+    #expect(result["error"] == nil)
+  }
+
+  @Test("Detect text in PDF with custom DPI")
+  func testDetectTextInPDFCustomDPI() throws {
+    try TestImageGenerator.setup()
+    defer { TestImageGenerator.cleanup() }
+
+    let pdfUrl = try TestImageGenerator.createTextPDF(text: "High Res Test")
+    let invoker = PluginInvoker.shared
+
+    let result = invoker.invoke(
+      tool: "detect_text",
+      args: [
+        "image_path": pdfUrl.path,
+        "dpi": 150
+      ])
+
+    #expect(result["error"] == nil)
+  }
+
+  @Test("Detect barcodes in PDF")
+  func testDetectBarcodesInPDF() throws {
+    try TestImageGenerator.setup()
+    defer { TestImageGenerator.cleanup() }
+
+    let pdfUrl = try TestImageGenerator.createTextPDF(text: "Barcode Test")
+    let invoker = PluginInvoker.shared
+
+    let result = invoker.invoke(
+      tool: "detect_barcodes",
+      args: [
+        "image_path": pdfUrl.path
+      ])
+
+    #expect(result["error"] == nil)
+    let barcodes = result["barcodes"] as? [[String: Any]]
+    #expect(barcodes != nil)
+  }
+
+  @Test("Detect document in PDF")
+  func testDetectDocumentInPDF() throws {
+    try TestImageGenerator.setup()
+    defer { TestImageGenerator.cleanup() }
+
+    let pdfUrl = try TestImageGenerator.createTextPDF(text: "Document Detection")
+    let invoker = PluginInvoker.shared
+
+    let result = invoker.invoke(
+      tool: "detect_document",
+      args: [
+        "image_path": pdfUrl.path
+      ])
+
+    #expect(result["error"] == nil)
+    print("PDF document detection result: \(result)")
+  }
+
+  @Test("Invalid PDF page returns error")
+  func testInvalidPDFPage() throws {
+    try TestImageGenerator.setup()
+    defer { TestImageGenerator.cleanup() }
+
+    let pdfUrl = try TestImageGenerator.createTextPDF(text: "Single Page", pages: 1)
+    let invoker = PluginInvoker.shared
+
+    let result = invoker.invoke(
+      tool: "detect_text",
+      args: [
+        "image_path": pdfUrl.path,
+        "page": 99
+      ])
+
+    #expect(result["error"] != nil)
+    let error = result["error"] as? String
+    #expect(error?.contains("page") == true)
+  }
+}
+
+@Suite("Document Detection Tests", .serialized)
 struct DocumentDetectionTests {
 
   @Test("Detect document boundaries")
@@ -389,7 +552,7 @@ struct DocumentDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createRectangleImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_document",
@@ -403,7 +566,7 @@ struct DocumentDetectionTests {
   }
 }
 
-@Suite("Barcode Detection Tests")
+@Suite("Barcode Detection Tests", .serialized)
 struct BarcodeDetectionTests {
 
   @Test("Detect barcodes returns empty for non-barcode image")
@@ -412,7 +575,7 @@ struct BarcodeDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createColorImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_barcodes",
@@ -432,7 +595,7 @@ struct BarcodeDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createColorImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_barcodes",
@@ -445,7 +608,7 @@ struct BarcodeDetectionTests {
   }
 }
 
-@Suite("Face Detection Tests")
+@Suite("Face Detection Tests", .serialized)
 struct FaceDetectionTests {
 
   @Test("Detect faces in image")
@@ -454,7 +617,7 @@ struct FaceDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createFaceImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_faces",
@@ -474,7 +637,7 @@ struct FaceDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createFaceImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_faces",
@@ -487,7 +650,7 @@ struct FaceDetectionTests {
   }
 }
 
-@Suite("Rectangle Detection Tests")
+@Suite("Rectangle Detection Tests", .serialized)
 struct RectangleDetectionTests {
 
   @Test("Detect rectangles in image")
@@ -496,7 +659,7 @@ struct RectangleDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createRectangleImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_rectangles",
@@ -516,7 +679,7 @@ struct RectangleDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createRectangleImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_rectangles",
@@ -532,7 +695,7 @@ struct RectangleDetectionTests {
   }
 }
 
-@Suite("Image Classification Tests")
+@Suite("Image Classification Tests", .serialized)
 struct ImageClassificationTests {
 
   @Test("Classify image")
@@ -541,7 +704,7 @@ struct ImageClassificationTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createSceneImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "classify_image",
@@ -561,7 +724,7 @@ struct ImageClassificationTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createSceneImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "classify_image",
@@ -577,7 +740,7 @@ struct ImageClassificationTests {
   }
 }
 
-@Suite("Horizon Detection Tests")
+@Suite("Horizon Detection Tests", .serialized)
 struct HorizonDetectionTests {
 
   @Test("Detect horizon")
@@ -586,7 +749,7 @@ struct HorizonDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createHorizonImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_horizon",
@@ -599,7 +762,7 @@ struct HorizonDetectionTests {
   }
 }
 
-@Suite("Body Pose Detection Tests")
+@Suite("Body Pose Detection Tests", .serialized)
 struct BodyPoseDetectionTests {
 
   @Test("Detect body pose")
@@ -608,7 +771,7 @@ struct BodyPoseDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createPersonImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_body_pose",
@@ -623,7 +786,7 @@ struct BodyPoseDetectionTests {
   }
 }
 
-@Suite("Hand Pose Detection Tests")
+@Suite("Hand Pose Detection Tests", .serialized)
 struct HandPoseDetectionTests {
 
   @Test("Detect hand pose")
@@ -632,7 +795,7 @@ struct HandPoseDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createColorImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_hand_pose",
@@ -652,7 +815,7 @@ struct HandPoseDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createColorImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_hand_pose",
@@ -665,7 +828,7 @@ struct HandPoseDetectionTests {
   }
 }
 
-@Suite("Animal Detection Tests")
+@Suite("Animal Detection Tests", .serialized)
 struct AnimalDetectionTests {
 
   @Test("Detect animals returns empty for non-animal image")
@@ -674,7 +837,7 @@ struct AnimalDetectionTests {
     defer { TestImageGenerator.cleanup() }
 
     let imageUrl = try TestImageGenerator.createColorImage()
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_animals",
@@ -689,7 +852,7 @@ struct AnimalDetectionTests {
   }
 }
 
-@Suite("Blur Faces Tests")
+@Suite("Blur Faces Tests", .serialized)
 struct BlurFacesTests {
 
   @Test("Blur faces in image")
@@ -699,7 +862,7 @@ struct BlurFacesTests {
 
     let imageUrl = try TestImageGenerator.createFaceImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("blurred.jpg")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "blur_faces",
@@ -721,7 +884,7 @@ struct BlurFacesTests {
 
     let imageUrl = try TestImageGenerator.createFaceImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("blurred_custom.jpg")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "blur_faces",
@@ -735,7 +898,7 @@ struct BlurFacesTests {
   }
 }
 
-@Suite("Auto Crop Tests")
+@Suite("Auto Crop Tests", .serialized)
 struct AutoCropTests {
 
   @Test("Auto crop image")
@@ -745,7 +908,7 @@ struct AutoCropTests {
 
     let imageUrl = try TestImageGenerator.createSceneImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("cropped.jpg")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "auto_crop",
@@ -767,7 +930,7 @@ struct AutoCropTests {
 
     let imageUrl = try TestImageGenerator.createSceneImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("cropped_16x9.jpg")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "auto_crop",
@@ -782,7 +945,7 @@ struct AutoCropTests {
   }
 }
 
-@Suite("Saliency Map Tests")
+@Suite("Saliency Map Tests", .serialized)
 struct SaliencyMapTests {
 
   @Test("Generate attention saliency map")
@@ -792,7 +955,7 @@ struct SaliencyMapTests {
 
     let imageUrl = try TestImageGenerator.createSceneImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("saliency_attention.png")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "generate_saliency_map",
@@ -818,7 +981,7 @@ struct SaliencyMapTests {
 
     let imageUrl = try TestImageGenerator.createSceneImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("saliency_objectness.png")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "generate_saliency_map",
@@ -833,7 +996,7 @@ struct SaliencyMapTests {
   }
 }
 
-@Suite("Remove Background Tests")
+@Suite("Remove Background Tests", .serialized)
 struct RemoveBackgroundTests {
 
   @Test("Remove background from image")
@@ -843,7 +1006,7 @@ struct RemoveBackgroundTests {
 
     let imageUrl = try TestImageGenerator.createPersonImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("nobg.png")
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "remove_background",
@@ -869,7 +1032,7 @@ struct RemoveBackgroundTests {
 
     let imageUrl = try TestImageGenerator.createPersonImage()
     let outputUrl = TestImageGenerator.tempDir.appendingPathComponent("nobg.jpg")  // Request JPG
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "remove_background",
@@ -886,12 +1049,12 @@ struct RemoveBackgroundTests {
   }
 }
 
-@Suite("Error Handling Tests")
+@Suite("Error Handling Tests", .serialized)
 struct ErrorHandlingTests {
 
   @Test("Handle invalid image path")
   func testInvalidImagePath() throws {
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "detect_text",
@@ -905,7 +1068,7 @@ struct ErrorHandlingTests {
 
   @Test("Handle invalid arguments")
   func testInvalidArguments() throws {
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(tool: "detect_text", args: [:])
 
@@ -914,7 +1077,7 @@ struct ErrorHandlingTests {
 
   @Test("Handle unknown tool")
   func testUnknownTool() throws {
-    let invoker = try PluginInvoker()
+    let invoker = PluginInvoker.shared
 
     let result = invoker.invoke(
       tool: "unknown_tool",

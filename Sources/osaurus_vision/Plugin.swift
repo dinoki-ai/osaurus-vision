@@ -1,6 +1,7 @@
 import AppKit
 import CoreImage
 import Foundation
+import PDFKit
 import Vision
 
 // MARK: - Injected Context
@@ -47,6 +48,93 @@ private enum VisionHelper {
       throw VisionError.imageLoadFailed(absolutePath)
     }
     return cgImage
+  }
+
+  /// Load image from file, with PDF support (renders specific page at given DPI)
+  static func loadImageOrPDF(
+    from path: String, context: FolderContext?, page: Int = 1, dpi: Int = 300
+  ) throws -> CGImage {
+    let absolutePath = resolvePath(path, context: context)
+    guard validatePath(absolutePath, context: context) else {
+      throw VisionError.invalidPath("Path outside working directory")
+    }
+
+    let url = URL(fileURLWithPath: absolutePath)
+
+    // Check if it's a PDF
+    if url.pathExtension.lowercased() == "pdf" {
+      return try loadPDFPage(from: url, page: page, dpi: dpi)
+    }
+
+    // Otherwise load as regular image
+    guard let nsImage = NSImage(contentsOfFile: absolutePath),
+      let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    else {
+      throw VisionError.imageLoadFailed(absolutePath)
+    }
+    return cgImage
+  }
+
+  /// Load a specific page from a PDF at given DPI
+  static func loadPDFPage(from url: URL, page: Int, dpi: Int) throws -> CGImage {
+    guard let pdfDocument = PDFDocument(url: url) else {
+      throw VisionError.imageLoadFailed("Failed to load PDF: \(url.path)")
+    }
+
+    let pageIndex = page - 1  // Convert to 0-based index
+    guard pageIndex >= 0, pageIndex < pdfDocument.pageCount,
+      let pdfPage = pdfDocument.page(at: pageIndex)
+    else {
+      throw VisionError.imageLoadFailed(
+        "PDF page \(page) not found (document has \(pdfDocument.pageCount) pages)")
+    }
+
+    // Get page bounds and calculate render size
+    let pageRect = pdfPage.bounds(for: .mediaBox)
+    let scale = CGFloat(dpi) / 72.0  // PDF points are 72 per inch
+    let width = Int(pageRect.width * scale)
+    let height = Int(pageRect.height * scale)
+
+    // Create bitmap context
+    guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+      let context = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+      )
+    else {
+      throw VisionError.imageLoadFailed("Failed to create graphics context")
+    }
+
+    // Fill with white background
+    context.setFillColor(CGColor.white)
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+
+    // Scale and render PDF page
+    context.scaleBy(x: scale, y: scale)
+    pdfPage.draw(with: .mediaBox, to: context)
+
+    guard let cgImage = context.makeImage() else {
+      throw VisionError.imageLoadFailed("Failed to render PDF page")
+    }
+
+    return cgImage
+  }
+
+  /// Get PDF page count
+  static func getPDFPageCount(from path: String, context: FolderContext?) -> Int? {
+    let absolutePath = resolvePath(path, context: context)
+    let url = URL(fileURLWithPath: absolutePath)
+    guard url.pathExtension.lowercased() == "pdf",
+      let pdfDocument = PDFDocument(url: url)
+    else {
+      return nil
+    }
+    return pdfDocument.pageCount
   }
 
   static func saveCIImage(_ image: CIImage, to path: String, context: FolderContext?) throws {
@@ -174,11 +262,18 @@ private struct DetectTextTool: VisionTool {
     let image_path: String
     let recognition_level: String?
     let languages: [String]?
+    let page: Int?  // PDF page number (1-indexed)
+    let dpi: Int?  // PDF render resolution (default: 300)
     let _context: FolderContext?
   }
 
   func execute(input: Args) throws -> [String: Any] {
-    let cgImage = try VisionHelper.loadImage(from: input.image_path, context: input._context)
+    let cgImage = try VisionHelper.loadImageOrPDF(
+      from: input.image_path,
+      context: input._context,
+      page: input.page ?? 1,
+      dpi: input.dpi ?? 300
+    )
     let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
 
     let request = VNRecognizeTextRequest()
@@ -204,11 +299,18 @@ private struct DetectDocumentTool: VisionTool {
 
   struct Args: Decodable {
     let image_path: String
+    let page: Int?  // PDF page number (1-indexed)
+    let dpi: Int?  // PDF render resolution (default: 300)
     let _context: FolderContext?
   }
 
   func execute(input: Args) throws -> [String: Any] {
-    let cgImage = try VisionHelper.loadImage(from: input.image_path, context: input._context)
+    let cgImage = try VisionHelper.loadImageOrPDF(
+      from: input.image_path,
+      context: input._context,
+      page: input.page ?? 1,
+      dpi: input.dpi ?? 300
+    )
     let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
 
     let request = VNDetectDocumentSegmentationRequest()
@@ -233,6 +335,8 @@ private struct DetectBarcodesTool: VisionTool {
   struct Args: Decodable {
     let image_path: String
     let symbologies: [String]?
+    let page: Int?  // PDF page number (1-indexed)
+    let dpi: Int?  // PDF render resolution (default: 300)
     let _context: FolderContext?
   }
 
@@ -243,7 +347,12 @@ private struct DetectBarcodesTool: VisionTool {
   ]
 
   func execute(input: Args) throws -> [String: Any] {
-    let cgImage = try VisionHelper.loadImage(from: input.image_path, context: input._context)
+    let cgImage = try VisionHelper.loadImageOrPDF(
+      from: input.image_path,
+      context: input._context,
+      page: input.page ?? 1,
+      dpi: input.dpi ?? 300
+    )
     let imageSize = CGSize(width: cgImage.width, height: cgImage.height)
 
     let request = VNDetectBarcodesRequest()
@@ -790,6 +899,54 @@ private struct RemoveBackgroundTool: VisionTool {
   }
 }
 
+// MARK: - PDF Info Tool
+
+private struct GetPDFInfoTool: VisionTool {
+  let name = "get_pdf_info"
+
+  struct Args: Decodable {
+    let pdf_path: String
+    let _context: FolderContext?
+  }
+
+  func execute(input: Args) throws -> [String: Any] {
+    let absolutePath = VisionHelper.resolvePath(input.pdf_path, context: input._context)
+    guard VisionHelper.validatePath(absolutePath, context: input._context) else {
+      throw VisionError.invalidPath("Path outside working directory")
+    }
+
+    let url = URL(fileURLWithPath: absolutePath)
+    guard url.pathExtension.lowercased() == "pdf" else {
+      throw VisionError.imageLoadFailed("File is not a PDF: \(input.pdf_path)")
+    }
+
+    guard let pdfDocument = PDFDocument(url: url) else {
+      throw VisionError.imageLoadFailed("Failed to load PDF: \(input.pdf_path)")
+    }
+
+    var result: [String: Any] = [
+      "page_count": pdfDocument.pageCount,
+      "path": absolutePath,
+    ]
+
+    // Get first page dimensions
+    if let firstPage = pdfDocument.page(at: 0) {
+      let bounds = firstPage.bounds(for: .mediaBox)
+      result["page_width_points"] = bounds.width
+      result["page_height_points"] = bounds.height
+      // Convert to inches (72 points per inch)
+      result["page_width_inches"] = bounds.width / 72.0
+      result["page_height_inches"] = bounds.height / 72.0
+    }
+
+    // Check if PDF is encrypted
+    result["is_encrypted"] = pdfDocument.isEncrypted
+    result["is_locked"] = pdfDocument.isLocked
+
+    return result
+  }
+}
+
 // MARK: - Plugin Context & Tools Registry
 
 private class PluginContext {
@@ -810,6 +967,7 @@ private class PluginContext {
     let autoCrop = AutoCropTool()
     let generateSaliencyMap = GenerateSaliencyMapTool()
     let removeBackground = RemoveBackgroundTool()
+    let getPDFInfo = GetPDFInfoTool()
 
     tools = [
       detectText.name: detectText.run,
@@ -826,6 +984,7 @@ private class PluginContext {
       autoCrop.name: autoCrop.run,
       generateSaliencyMap.name: generateSaliencyMap.run,
       removeBackground.name: removeBackground.run,
+      getPDFInfo.name: getPDFInfo.run,
     ]
   }
 
@@ -871,13 +1030,15 @@ private let manifest = """
       "tools": [
         {
           "id": "detect_text",
-          "description": "Detect and recognize text in an image using OCR. Returns detected text blocks with bounding boxes and confidence scores.",
+          "description": "Detect and recognize text in an image or PDF using OCR. Returns detected text blocks with bounding boxes and confidence scores.",
           "parameters": {
             "type": "object",
             "properties": {
-              "image_path": {"type": "string", "description": "Path to the image file (relative to working directory or absolute)"},
+              "image_path": {"type": "string", "description": "Path to the image or PDF file (relative to working directory or absolute)"},
               "recognition_level": {"type": "string", "enum": ["accurate", "fast"], "description": "Recognition accuracy level. Default: accurate"},
-              "languages": {"type": "array", "items": {"type": "string"}, "description": "Language codes to recognize (e.g., ['en-US', 'fr-FR'])"}
+              "languages": {"type": "array", "items": {"type": "string"}, "description": "Language codes to recognize (e.g., ['en-US', 'fr-FR'])"},
+              "page": {"type": "integer", "description": "PDF page number (1-indexed). Default: 1"},
+              "dpi": {"type": "integer", "description": "PDF render resolution in DPI. Default: 300"}
             },
             "required": ["image_path"]
           },
@@ -886,10 +1047,14 @@ private let manifest = """
         },
         {
           "id": "detect_document",
-          "description": "Detect document boundaries in an image. Returns corner points for perspective correction.",
+          "description": "Detect document boundaries in an image or PDF. Returns corner points for perspective correction.",
           "parameters": {
             "type": "object",
-            "properties": {"image_path": {"type": "string", "description": "Path to the image file"}},
+            "properties": {
+              "image_path": {"type": "string", "description": "Path to the image or PDF file"},
+              "page": {"type": "integer", "description": "PDF page number (1-indexed). Default: 1"},
+              "dpi": {"type": "integer", "description": "PDF render resolution in DPI. Default: 300"}
+            },
             "required": ["image_path"]
           },
           "requirements": [],
@@ -897,12 +1062,14 @@ private let manifest = """
         },
         {
           "id": "detect_barcodes",
-          "description": "Detect and decode barcodes and QR codes in an image.",
+          "description": "Detect and decode barcodes and QR codes in an image or PDF.",
           "parameters": {
             "type": "object",
             "properties": {
-              "image_path": {"type": "string", "description": "Path to the image file"},
-              "symbologies": {"type": "array", "items": {"type": "string"}, "description": "Barcode types: qr, aztec, code128, code39, code93, datamatrix, ean8, ean13, itf14, pdf417, upce"}
+              "image_path": {"type": "string", "description": "Path to the image or PDF file"},
+              "symbologies": {"type": "array", "items": {"type": "string"}, "description": "Barcode types: qr, aztec, code128, code39, code93, datamatrix, ean8, ean13, itf14, pdf417, upce"},
+              "page": {"type": "integer", "description": "PDF page number (1-indexed). Default: 1"},
+              "dpi": {"type": "integer", "description": "PDF render resolution in DPI. Default: 300"}
             },
             "required": ["image_path"]
           },
@@ -1060,6 +1227,19 @@ private let manifest = """
           },
           "requirements": [],
           "permission_policy": "ask"
+        },
+        {
+          "id": "get_pdf_info",
+          "description": "Get information about a PDF file including page count, dimensions, and encryption status. Use this before processing PDFs to determine how many pages exist.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "pdf_path": {"type": "string", "description": "Path to the PDF file"}
+            },
+            "required": ["pdf_path"]
+          },
+          "requirements": [],
+          "permission_policy": "auto"
         }
       ]
     }
