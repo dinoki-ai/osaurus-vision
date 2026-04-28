@@ -91,18 +91,25 @@ detect_barcodes(image_path: "shipping_label.pdf")
    swift build -c release
    ```
 
-2. Extract manifest (to verify):
+2. Test:
+   ```bash
+   swift test
+   ```
+   The tests generate their image and PDF fixtures at runtime; `Tests/Resources`
+   is kept in the repository so SwiftPM can copy the declared resource folder.
+
+3. Extract manifest (to verify):
    ```bash
    osaurus manifest extract .build/release/libosaurus-vision.dylib
    ```
    
-3. Package (for distribution):
+4. Package (for distribution):
    ```bash
    osaurus tools package osaurus.vision 0.1.0
    ```
    This creates `osaurus.vision-0.1.0.zip`.
    
-4. Install locally:
+5. Install locally:
    ```bash
    osaurus tools install ./osaurus.vision-0.1.0.zip
    ```

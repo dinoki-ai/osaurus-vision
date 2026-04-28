@@ -1,0 +1,1 @@
+# SwiftPM copies this declared test resource directory during `swift test`.
