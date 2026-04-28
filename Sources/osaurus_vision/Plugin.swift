@@ -137,13 +137,19 @@ private enum VisionHelper {
     return pdfDocument.pageCount
   }
 
-  static func saveCIImage(_ image: CIImage, to path: String, context: FolderContext?) throws {
+  static func saveCIImage(
+    _ image: CIImage, to path: String, context: FolderContext?, overwrite: Bool = false
+  ) throws {
     let absolutePath = resolvePath(path, context: context)
     guard validatePath(absolutePath, context: context) else {
       throw VisionError.invalidPath("Path outside working directory")
     }
 
     let url = URL(fileURLWithPath: absolutePath)
+    if FileManager.default.fileExists(atPath: url.path) && !overwrite {
+      throw VisionError.saveFailed(
+        "Output file already exists: \(absolutePath). Pass overwrite=true to replace it.")
+    }
     let ciContext = CIContext()
 
     // Create parent directory if needed
@@ -646,6 +652,7 @@ private struct BlurFacesTool: VisionTool {
     let image_path: String
     let output_path: String
     let blur_radius: Double?
+    let overwrite: Bool?
     let _context: FolderContext?
   }
 
@@ -659,7 +666,8 @@ private struct BlurFacesTool: VisionTool {
 
     let faces = request.results ?? []
     guard !faces.isEmpty else {
-      try VisionHelper.saveCIImage(ciImage, to: input.output_path, context: input._context)
+      try VisionHelper.saveCIImage(
+        ciImage, to: input.output_path, context: input._context, overwrite: input.overwrite ?? false)
       return [
         "output_path": VisionHelper.resolvePath(input.output_path, context: input._context),
         "faces_blurred": 0,
@@ -698,7 +706,8 @@ private struct BlurFacesTool: VisionTool {
       }
     }
 
-    try VisionHelper.saveCIImage(ciImage, to: input.output_path, context: input._context)
+    try VisionHelper.saveCIImage(
+      ciImage, to: input.output_path, context: input._context, overwrite: input.overwrite ?? false)
     return [
       "output_path": VisionHelper.resolvePath(input.output_path, context: input._context),
       "faces_blurred": faces.count,
@@ -714,6 +723,7 @@ private struct AutoCropTool: VisionTool {
     let output_path: String
     let aspect_ratio: String?
     let padding: Double?
+    let overwrite: Bool?
     let _context: FolderContext?
   }
 
@@ -728,7 +738,8 @@ private struct AutoCropTool: VisionTool {
     guard let obs = request.results?.first, let salientObjects = obs.salientObjects,
       !salientObjects.isEmpty
     else {
-      try VisionHelper.saveCIImage(ciImage, to: input.output_path, context: input._context)
+      try VisionHelper.saveCIImage(
+        ciImage, to: input.output_path, context: input._context, overwrite: input.overwrite ?? false)
       return [
         "output_path": VisionHelper.resolvePath(input.output_path, context: input._context),
         "cropped": false,
@@ -766,7 +777,8 @@ private struct AutoCropTool: VisionTool {
     let croppedImage = ciImage.cropped(to: cropRect)
       .transformed(by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y))
 
-    try VisionHelper.saveCIImage(croppedImage, to: input.output_path, context: input._context)
+    try VisionHelper.saveCIImage(
+      croppedImage, to: input.output_path, context: input._context, overwrite: input.overwrite ?? false)
     return [
       "output_path": VisionHelper.resolvePath(input.output_path, context: input._context),
       "cropped": true,
@@ -793,6 +805,7 @@ private struct GenerateSaliencyMapTool: VisionTool {
     let image_path: String
     let output_path: String
     let type: String?
+    let overwrite: Bool?
     let _context: FolderContext?
   }
 
@@ -829,7 +842,9 @@ private struct GenerateSaliencyMapTool: VisionTool {
       if let colored = colorFilter.outputImage { saliencyImage = colored }
     }
 
-    try VisionHelper.saveCIImage(saliencyImage, to: input.output_path, context: input._context)
+    try VisionHelper.saveCIImage(
+      saliencyImage, to: input.output_path, context: input._context,
+      overwrite: input.overwrite ?? false)
 
     let regions = (obs.salientObjects ?? []).map { obj in
       [
@@ -852,6 +867,7 @@ private struct RemoveBackgroundTool: VisionTool {
   struct Args: Decodable {
     let image_path: String
     let output_path: String
+    let overwrite: Bool?
     let _context: FolderContext?
   }
 
@@ -891,7 +907,8 @@ private struct RemoveBackgroundTool: VisionTool {
       if !outputPath.hasSuffix(".png") { outputPath += ".png" }
     }
 
-    try VisionHelper.saveCIImage(outputImage, to: outputPath, context: input._context)
+    try VisionHelper.saveCIImage(
+      outputImage, to: outputPath, context: input._context, overwrite: input.overwrite ?? false)
     return [
       "output_path": VisionHelper.resolvePath(outputPath, context: input._context),
       "instances_detected": obs.allInstances.count,
@@ -1176,7 +1193,8 @@ private let manifest = """
             "properties": {
               "image_path": {"type": "string", "description": "Path to the input image"},
               "output_path": {"type": "string", "description": "Path to save the output image"},
-              "blur_radius": {"type": "number", "description": "Blur intensity. Default: 30"}
+              "blur_radius": {"type": "number", "description": "Blur intensity. Default: 30"},
+              "overwrite": {"type": "boolean", "description": "Replace an existing output file. Default: false"}
             },
             "required": ["image_path", "output_path"]
           },
@@ -1192,7 +1210,8 @@ private let manifest = """
               "image_path": {"type": "string", "description": "Path to the input image"},
               "output_path": {"type": "string", "description": "Path to save the cropped image"},
               "aspect_ratio": {"type": "string", "description": "Target aspect ratio (e.g., '16:9', '1:1')"},
-              "padding": {"type": "number", "description": "Padding around salient region (0-1). Default: 0.1"}
+              "padding": {"type": "number", "description": "Padding around salient region (0-1). Default: 0.1"},
+              "overwrite": {"type": "boolean", "description": "Replace an existing output file. Default: false"}
             },
             "required": ["image_path", "output_path"]
           },
@@ -1207,7 +1226,8 @@ private let manifest = """
             "properties": {
               "image_path": {"type": "string", "description": "Path to the input image"},
               "output_path": {"type": "string", "description": "Path to save the saliency map"},
-              "type": {"type": "string", "enum": ["attention", "objectness"], "description": "Saliency type. Default: attention"}
+              "type": {"type": "string", "enum": ["attention", "objectness"], "description": "Saliency type. Default: attention"},
+              "overwrite": {"type": "boolean", "description": "Replace an existing output file. Default: false"}
             },
             "required": ["image_path", "output_path"]
           },
@@ -1221,7 +1241,8 @@ private let manifest = """
             "type": "object",
             "properties": {
               "image_path": {"type": "string", "description": "Path to the input image"},
-              "output_path": {"type": "string", "description": "Path to save output (saved as PNG)"}
+              "output_path": {"type": "string", "description": "Path to save output (saved as PNG)"},
+              "overwrite": {"type": "boolean", "description": "Replace an existing output file. Default: false"}
             },
             "required": ["image_path", "output_path"]
           },
