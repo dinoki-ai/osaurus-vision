@@ -378,6 +378,26 @@ struct VisionPluginTests {
     #expect(toolIds.contains("detect_faces"))
     #expect(toolIds.contains("remove_background"))
   }
+
+  @Test("Image-writing tools expose explicit output and overwrite controls")
+  func testOutputSafetyManifest() throws {
+    let invoker = PluginInvoker.shared
+    let manifest = invoker.getManifest()
+    let capabilities = manifest["capabilities"] as! [String: Any]
+    let tools = capabilities["tools"] as! [[String: Any]]
+    let byId = Dictionary(uniqueKeysWithValues: tools.map { ($0["id"] as! String, $0) })
+
+    for id in ["blur_faces", "auto_crop", "generate_saliency_map", "remove_background"] {
+      let tool = byId[id]!
+      #expect(tool["permission_policy"] as? String == "ask")
+
+      let params = tool["parameters"] as! [String: Any]
+      let properties = params["properties"] as! [String: Any]
+      let required = Set(params["required"] as? [String] ?? [])
+      #expect(required == ["image_path", "output_path"], "Tool \(id) should require explicit paths")
+      #expect(properties["overwrite"] != nil, "Tool \(id) should expose overwrite")
+    }
+  }
 }
 
 @Suite("Text Detection Tests", .serialized)
@@ -869,6 +889,7 @@ struct BlurFacesTests {
       args: [
         "image_path": imageUrl.path,
         "output_path": outputUrl.path,
+        "overwrite": true,
       ])
 
     #expect(result["error"] == nil)
@@ -892,9 +913,30 @@ struct BlurFacesTests {
         "image_path": imageUrl.path,
         "output_path": outputUrl.path,
         "blur_radius": 50,
+        "overwrite": true,
       ])
 
     #expect(result["error"] == nil)
+  }
+
+  @Test("Blur faces refuses to overwrite existing output by default")
+  func testBlurFacesOverwriteSafety() throws {
+    try TestImageGenerator.setup()
+    defer { TestImageGenerator.cleanup() }
+
+    let imageUrl = try TestImageGenerator.createFaceImage()
+    let outputUrl = TestImageGenerator.tempDir.appendingPathComponent(
+      "blurred_existing_\(UUID().uuidString).jpg")
+    try Data("existing".utf8).write(to: outputUrl)
+
+    let result = PluginInvoker.shared.invoke(
+      tool: "blur_faces",
+      args: [
+        "image_path": imageUrl.path,
+        "output_path": outputUrl.path,
+      ])
+
+    #expect((result["error"] as? String)?.contains("already exists") == true)
   }
 }
 
@@ -915,6 +957,7 @@ struct AutoCropTests {
       args: [
         "image_path": imageUrl.path,
         "output_path": outputUrl.path,
+        "overwrite": true,
       ])
 
     #expect(result["error"] == nil)
@@ -939,6 +982,7 @@ struct AutoCropTests {
         "output_path": outputUrl.path,
         "aspect_ratio": "16:9",
         "padding": 0.2,
+        "overwrite": true,
       ])
 
     #expect(result["error"] == nil)
@@ -963,6 +1007,7 @@ struct SaliencyMapTests {
         "image_path": imageUrl.path,
         "output_path": outputUrl.path,
         "type": "attention",
+        "overwrite": true,
       ])
 
     #expect(result["error"] == nil)
@@ -989,6 +1034,7 @@ struct SaliencyMapTests {
         "image_path": imageUrl.path,
         "output_path": outputUrl.path,
         "type": "objectness",
+        "overwrite": true,
       ])
 
     #expect(result["error"] == nil)
@@ -1013,6 +1059,7 @@ struct RemoveBackgroundTests {
       args: [
         "image_path": imageUrl.path,
         "output_path": outputUrl.path,
+        "overwrite": true,
       ])
 
     // Note: VNGenerateForegroundInstanceMaskRequest may not detect foreground in synthetic images
@@ -1039,6 +1086,7 @@ struct RemoveBackgroundTests {
       args: [
         "image_path": imageUrl.path,
         "output_path": outputUrl.path,
+        "overwrite": true,
       ])
 
     // Should convert to PNG for transparency
